@@ -1,0 +1,130 @@
+name: Verify libkernel ksem shared duplicates
+
+on:
+  push:
+    branches: [verify/libkernel-ksem-shared-duplicates]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGETS: guest_kernel_sys_ksem_tests guest_dup_tests guest_kernel_fcntl_tests guest_kernel_web_forwards_tests
+  CONTROLS: ^(guest_dup|guest_kernel_fcntl|guest_kernel_web_forwards)$
+  TARGET_TEST: ^guest_kernel_sys_ksem$
+  RESTORE: core/libs/prx/libkernel/File/src/Stdio.cpp core/libs/prx/libkernel/Semaphore/src/Ksem.cpp core/libs/prx/libkernel/Semaphore/include/Ksem.hpp
+
+jobs:
+  windows:
+    name: Windows (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, unfixed]
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      WINLIBS_SHA256: cb2fbad6162540cdf5e1facdce08d4dac359e8cf64f7f696a99274291763b815
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Show the commits under test
+        run: git log --format='%h %s' -3
+      - name: Restore the library sources from before the change
+        if: matrix.variant == 'unfixed'
+        run: |
+          git checkout HEAD~2 -- $RESTORE
+          git status --short
+      - name: Check out the submodules
+        run: git submodule update --init --recursive --depth 1 --jobs 8
+      - name: Point the WinLibs CMake at the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - name: Install the pinned WinLibs toolchain
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          echo "$WINLIBS_SHA256  $RUNNER_TEMP/winlibs.zip" | sha256sum -c -
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+          echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown"
+      - name: Build the tests
+        run: cmake --build build --target $TARGETS
+      - name: Run the tests the change does not target
+        run: ctest --test-dir build -R "$CONTROLS" --output-on-failure --timeout 120 --no-tests=error
+      - name: Run guest_kernel_sys_ksem
+        id: target
+        continue-on-error: ${{ matrix.variant == 'unfixed' }}
+        run: ctest --test-dir build -R "$TARGET_TEST" --output-on-failure --timeout 120 --no-tests=error
+      - name: Require guest_kernel_sys_ksem to fail without the change
+        if: matrix.variant == 'unfixed'
+        env:
+          OUTCOME: ${{ steps.target.outcome }}
+        run: |
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "guest_kernel_sys_ksem fails without the change, as expected"
+          else
+            echo "::error::guest_kernel_sys_ksem passed without the change, so the new cases do not exercise it"
+            exit 1
+          fi
+
+  linux:
+    name: Linux (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, unfixed]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Show the commits under test
+        run: git log --format='%h %s' -3
+      - name: Restore the library sources from before the change
+        if: matrix.variant == 'unfixed'
+        run: |
+          git checkout HEAD~2 -- $RESTORE
+          git status --short
+      - name: Check out the submodules
+        run: git submodule update --init --recursive --depth 1 --jobs 8
+      - name: Install the build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build libx11-dev libxext-dev libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown"
+      - name: Build the tests
+        run: cmake --build build --target $TARGETS
+      - name: Run the tests the change does not target
+        run: ctest --test-dir build -R "$CONTROLS" --output-on-failure --timeout 120 --no-tests=error
+      - name: Run guest_kernel_sys_ksem
+        id: target
+        continue-on-error: ${{ matrix.variant == 'unfixed' }}
+        run: ctest --test-dir build -R "$TARGET_TEST" --output-on-failure --timeout 120 --no-tests=error
+      - name: Require guest_kernel_sys_ksem to fail without the change
+        if: matrix.variant == 'unfixed'
+        env:
+          OUTCOME: ${{ steps.target.outcome }}
+        run: |
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "guest_kernel_sys_ksem fails without the change, as expected"
+          else
+            echo "::error::guest_kernel_sys_ksem passed without the change, so the new cases do not exercise it"
+            exit 1
+          fi
